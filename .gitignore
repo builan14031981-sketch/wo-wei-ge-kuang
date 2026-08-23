@@ -1,9 +1,14 @@
 # 编译产物 / 打包产物
 __pycache__/
 *.pyc
-build/
+build/*
+!build/installer.nsi
 dist/
 *.spec
+
+# 发布用的二进制（体积大，不纳入版本库；由打包流程生成）
+我为歌狂便携版.zip
+我为歌狂安装版.exe
 
 # 二进制（ffmpeg 体积大，不纳入版本库，打包时由 imageio-ffmpeg 提供）
 ffmpeg.exe
