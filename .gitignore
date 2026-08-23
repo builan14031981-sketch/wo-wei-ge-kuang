@@ -17,3 +17,6 @@ Thumbs.db
 # 本地令牌等敏感文件（切勿提交）
 *.token
 gh_token.txt
+
+# opencode 内部数据
+.opencode/
