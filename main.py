@@ -39,7 +39,7 @@ class SearchThread(QThread):
             self.error_signal.emit(str(e))
 
 class PlaylistParseThread(QThread):
-    songs_signal = pyqtSignal(list)
+    songs_signal = pyqtSignal(object)
     error_signal = pyqtSignal(str)
 
     def __init__(self, engine, playlist_url):
