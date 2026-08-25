@@ -12,12 +12,24 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QStackedWidget, QTableWidget,
     QTableWidgetItem, QHeaderView, QFileDialog, QProgressBar,
     QComboBox, QFrame, QMessageBox, QAbstractItemView,
-    QCheckBox, QMenu
+    QCheckBox, QMenu, QPlainTextEdit
 )
 import qtawesome as qta
 
 from core_engine import MusicEngine, sanitize_filename
 from styles import QSS_STYLE
+
+# 规范音源 -> UI 显示名（顺序即下拉框顺序）
+SOURCE_DISPLAY = [
+    ('netease', '网易云音乐'),
+    ('tencent', 'QQ音乐'),
+    ('kugou', '酷狗音乐'),
+    ('kuwo', '酷我音乐'),
+    ('migu', '咪咕音乐'),
+    ('bilibili', 'Bilibili 音频'),
+    ('douyin', '抖音'),
+    ('ximalaya', '喜马拉雅'),
+]
 
 # ----------------- 后台工作线程定义 (支持原子级安全打断与停止) -----------------
 
@@ -53,6 +65,21 @@ class PlaylistParseThread(QThread):
             self.songs_signal.emit(songs)
         except Exception as e:
             self.error_signal.emit(str(e))
+
+class SourceProbeThread(QThread):
+    result_signal = pyqtSignal(list)
+
+    def __init__(self, engine):
+        super().__init__()
+        self.engine = engine
+
+    def run(self):
+        try:
+            avail = self.engine.get_available_sources()
+        except Exception:
+            avail = []
+        self.result_signal.emit(avail)
+
 
 class SingleDownloadThread(QThread):
     progress_signal = pyqtSignal(int, str, str)
@@ -155,6 +182,9 @@ class MusicDownloaderApp(QMainWindow):
         self.init_window()
         self.init_ui()
         self.setStyleSheet(QSS_STYLE)
+
+        # 启动音源自检，自动隐藏当前网络下不可用的音源
+        self.start_source_probe()
 
     def init_window(self):
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
@@ -355,7 +385,8 @@ class MusicDownloaderApp(QMainWindow):
         self.input_search.returnPressed.connect(self.start_search)
 
         self.combo_source = QComboBox()
-        self.combo_source.addItems(["全网智能聚合", "网易云音乐", "QQ音乐", "酷狗音乐", "酷我音乐", "Bilibili 音频"])
+        self._source_map = {"全网智能聚合": "all"}
+        self.refresh_source_options([c for c, _ in SOURCE_DISPLAY])  # 先全量显示，待自检后收敛
 
         self.btn_search = QPushButton(" 搜索歌曲")
         self.btn_search.setProperty("class", "PrimaryBtn")
@@ -426,20 +457,38 @@ class MusicDownloaderApp(QMainWindow):
         layout.addWidget(self.table_search)
         return page
 
+    def refresh_source_options(self, available):
+        self._source_map = {"全网智能聚合": "all"}
+        self.combo_source.blockSignals(True)
+        self.combo_source.clear()
+        self.combo_source.addItem("全网智能聚合")
+        shown = 0
+        for canon, disp in SOURCE_DISPLAY:
+            if canon in available:
+                self.combo_source.addItem(disp)
+                self._source_map[disp] = canon
+                shown += 1
+        self.combo_source.blockSignals(False)
+        self._probe_shown_count = shown
+
+    def start_source_probe(self):
+        self.probe_thread = SourceProbeThread(self.engine)
+        self.probe_thread.result_signal.connect(self.on_source_probe_done)
+        self.probe_thread.start()
+
+    def on_source_probe_done(self, available):
+        # 若全部探测失败（如断网），保留全量显示，避免下拉框只剩“全网聚合”
+        if not available:
+            available = [c for c, _ in SOURCE_DISPLAY]
+        self.refresh_source_options(available)
+        self.status_label.setText(f"✨ 聚合全网音源 · 可用音源 {len(available)} 个（已自动隐藏不可用的）")
+
     def start_search(self):
         kw = self.input_search.text().strip()
         if not kw:
             return
         
-        source_map = {
-            "全网智能聚合": "all",
-            "网易云音乐": "netease",
-            "QQ音乐": "tencent",
-            "酷狗音乐": "kugou",
-            "酷我音乐": "kuwo",
-            "Bilibili 音频": "bilibili"
-        }
-        src = source_map.get(self.combo_source.currentText(), "all")
+        src = self._source_map.get(self.combo_source.currentText(), "all")
         
         self.btn_search.setEnabled(False)
         self.btn_search.setText(" 搜索中...")
@@ -580,7 +629,7 @@ class MusicDownloaderApp(QMainWindow):
         input_card_layout.setSpacing(10)
 
         self.input_playlist = QLineEdit()
-        self.input_playlist.setPlaceholderText("粘贴酷狗/网易云歌单分享链接 (如 https://t1.kugou.com/...)")
+        self.input_playlist.setPlaceholderText("粘贴歌单分享链接（支持 网易云 / 酷狗；汽水音乐/抖音/喜马拉雅请用下方文本框粘贴歌名）")
 
         self.btn_parse_playlist = QPushButton(" 解析歌单")
         self.btn_parse_playlist.setProperty("class", "PrimaryBtn")
@@ -591,6 +640,31 @@ class MusicDownloaderApp(QMainWindow):
         input_card_layout.addWidget(self.btn_parse_playlist, 2)
 
         layout.addWidget(input_card)
+
+        # 粘贴歌单文本导入：适用于汽水音乐/抖音/喜马拉雅等任意平台（只需歌名，再去其它音源搜同名下）
+        paste_card = QFrame()
+        paste_card.setProperty("class", "CardWidget")
+        paste_card_layout = QHBoxLayout(paste_card)
+        paste_card_layout.setContentsMargins(10, 8, 10, 8)
+        paste_card_layout.setSpacing(10)
+
+        self.text_playlist = QPlainTextEdit()
+        self.text_playlist.setPlaceholderText(
+            "或粘贴歌单文本：每行一首，可写「歌手 - 歌名」或只写歌名。\n"
+            "适用于汽水音乐 / 抖音 / 喜马拉雅 等任意平台——只要拿到歌名，程序会去其它可下载音源搜同名歌曲。"
+        )
+        self.text_playlist.setMinimumHeight(54)
+        self.text_playlist.setMaximumHeight(110)
+
+        self.btn_parse_text = QPushButton(" 解析文本歌单")
+        self.btn_parse_text.setProperty("class", "PrimaryBtn")
+        self.btn_parse_text.setIcon(qta.icon('fa5s.list', color='#FFFFFF'))
+        self.btn_parse_text.clicked.connect(self.start_parse_text)
+
+        paste_card_layout.addWidget(self.text_playlist, 7)
+        paste_card_layout.addWidget(self.btn_parse_text, 2)
+
+        layout.addWidget(paste_card)
 
         # 歌单多选快捷栏
         pl_batch_bar = QWidget()
@@ -663,6 +737,27 @@ class MusicDownloaderApp(QMainWindow):
         self.parse_thread.songs_signal.connect(self.on_playlist_parsed)
         self.parse_thread.error_signal.connect(self.on_playlist_error)
         self.parse_thread.start()
+
+    def start_parse_text(self):
+        text = self.text_playlist.toPlainText().strip()
+        if not text:
+            self.status_label.setText("⚠️ 请先在文本框中粘贴歌单（每行一首）")
+            return
+
+        self.btn_parse_text.setEnabled(False)
+        self.btn_parse_text.setText(" 解析中...")
+        self.status_label.setText("📋 正在解析粘贴的歌单文本...")
+
+        songs = self.engine.parse_text_playlist(text)
+
+        self.btn_parse_text.setEnabled(True)
+        self.btn_parse_text.setText(" 解析文本歌单")
+
+        if not songs:
+            self.status_label.setText("❌ 未能从文本中解析出歌曲，请确认每行一首（可写「歌手 - 歌名」）")
+            return
+
+        self.on_playlist_parsed(songs)
 
     def on_playlist_parsed(self, songs):
         self.btn_parse_playlist.setEnabled(True)
