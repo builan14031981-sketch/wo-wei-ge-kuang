@@ -381,4 +381,10 @@ QMenu::icon {
     padding-left: 4px;
     padding-right: 8px;
 }
+
+/* 弹出层强制不透明，避免继承全局透明导致 Windows 下全黑 */
+QMenu, QMessageBox, QDialog, QFileDialog {
+    background-color: #FFFFFF;
+    color: #1D1D1F;
+}
 """

@@ -25,3 +25,11 @@ gh_token.txt
 
 # opencode 内部数据
 .opencode/
+
+# 运行时生成的数据文件
+history.json
+
+# 图标方案预览 / 候选图标 (仅保留 app_icon.ico)
+icons_preview/
+icon_方案*.ico
+

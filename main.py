@@ -3,6 +3,7 @@ import sys
 import time
 import subprocess
 import ctypes
+import json
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QPoint, QSize, QUrl
 )
@@ -12,7 +13,7 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QStackedWidget, QTableWidget,
     QTableWidgetItem, QHeaderView, QFileDialog, QProgressBar,
     QComboBox, QFrame, QMessageBox, QAbstractItemView,
-    QCheckBox, QMenu, QPlainTextEdit
+    QCheckBox, QMenu, QPlainTextEdit, QListWidget, QListWidgetItem
 )
 import qtawesome as qta
 
@@ -178,6 +179,15 @@ class MusicDownloaderApp(QMainWindow):
 
         self.search_results_data = []
         self.playlist_results_data = []
+
+        # 历史记录（搜索/解析）持久化
+        self.history_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history.json")
+        self.search_history = []
+        self.playlist_history = []
+        self._last_playlist_type = None
+        self._last_playlist_input = None
+        self._last_search_kw = None
+        self._load_history()
 
         self.init_window()
         self.init_ui()
@@ -399,6 +409,33 @@ class MusicDownloaderApp(QMainWindow):
 
         layout.addWidget(search_card)
 
+        # 搜索历史记录
+        sh_card = QFrame()
+        sh_card.setProperty("class", "CardWidget")
+        sh_layout = QVBoxLayout(sh_card)
+        sh_layout.setContentsMargins(10, 8, 10, 8)
+        sh_layout.setSpacing(6)
+
+        sh_hdr = QHBoxLayout()
+        sh_title = QLabel("🕘 历史搜索")
+        sh_title.setStyleSheet("font-weight: 600; color: #1D1D1F; font-size: 13px;")
+        self.btn_clear_search_history = QPushButton("清空")
+        self.btn_clear_search_history.setProperty("class", "SecondaryBtn")
+        self.btn_clear_search_history.setIcon(qta.icon('fa5s.trash-alt', color='#4B5563'))
+        self.btn_clear_search_history.clicked.connect(self.clear_search_history)
+        sh_hdr.addWidget(sh_title)
+        sh_hdr.addStretch()
+        sh_hdr.addWidget(self.btn_clear_search_history)
+        sh_layout.addLayout(sh_hdr)
+
+        self.list_search_history = QListWidget()
+        self.list_search_history.setMaximumHeight(96)
+        self.list_search_history.setStyleSheet("background: #FFFFFF; border: 1px solid rgba(0,0,0,0.08); border-radius: 8px; padding: 4px;")
+        self.list_search_history.itemClicked.connect(self.on_search_history_clicked)
+        sh_layout.addWidget(self.list_search_history)
+
+        layout.addWidget(sh_card)
+
         # 多选快捷栏 (支持全选/全不选智能Toggle)
         batch_bar = QWidget()
         batch_bar_layout = QHBoxLayout(batch_bar)
@@ -455,6 +492,7 @@ class MusicDownloaderApp(QMainWindow):
         self.table_search.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
 
         layout.addWidget(self.table_search)
+        self._refresh_search_history_ui()
         return page
 
     def refresh_source_options(self, available):
@@ -487,6 +525,7 @@ class MusicDownloaderApp(QMainWindow):
         kw = self.input_search.text().strip()
         if not kw:
             return
+        self._last_search_kw = kw
         
         src = self._source_map.get(self.combo_source.currentText(), "all")
         
@@ -504,6 +543,8 @@ class MusicDownloaderApp(QMainWindow):
         self.btn_search.setText(" 搜索歌曲")
         self.status_label.setText(f"✓ 找到 {len(results)} 条高品质音源")
         self.search_results_data = results
+        if results:
+            self.add_search_history(self._last_search_kw)
         
         self.table_search.setRowCount(0)
         for row, item in enumerate(results):
@@ -666,6 +707,33 @@ class MusicDownloaderApp(QMainWindow):
 
         layout.addWidget(paste_card)
 
+        # 解析历史记录
+        ph_card = QFrame()
+        ph_card.setProperty("class", "CardWidget")
+        ph_layout = QVBoxLayout(ph_card)
+        ph_layout.setContentsMargins(10, 8, 10, 8)
+        ph_layout.setSpacing(6)
+
+        ph_hdr = QHBoxLayout()
+        ph_title = QLabel("🕘 历史解析")
+        ph_title.setStyleSheet("font-weight: 600; color: #1D1D1F; font-size: 13px;")
+        self.btn_clear_playlist_history = QPushButton("清空")
+        self.btn_clear_playlist_history.setProperty("class", "SecondaryBtn")
+        self.btn_clear_playlist_history.setIcon(qta.icon('fa5s.trash-alt', color='#4B5563'))
+        self.btn_clear_playlist_history.clicked.connect(self.clear_playlist_history)
+        ph_hdr.addWidget(ph_title)
+        ph_hdr.addStretch()
+        ph_hdr.addWidget(self.btn_clear_playlist_history)
+        ph_layout.addLayout(ph_hdr)
+
+        self.list_playlist_history = QListWidget()
+        self.list_playlist_history.setMaximumHeight(96)
+        self.list_playlist_history.setStyleSheet("background: #FFFFFF; border: 1px solid rgba(0,0,0,0.08); border-radius: 8px; padding: 4px;")
+        self.list_playlist_history.itemClicked.connect(self.on_playlist_history_clicked)
+        ph_layout.addWidget(self.list_playlist_history)
+
+        layout.addWidget(ph_card)
+
         # 歌单多选快捷栏
         pl_batch_bar = QWidget()
         pl_batch_layout = QHBoxLayout(pl_batch_bar)
@@ -722,12 +790,15 @@ class MusicDownloaderApp(QMainWindow):
 
         layout.addWidget(self.table_playlist)
         self.current_parsed_songs = []
+        self._refresh_playlist_history_ui()
         return page
 
     def start_parse_playlist(self):
         url = self.input_playlist.text().strip()
         if not url:
             return
+        self._last_playlist_type = 'url'
+        self._last_playlist_input = url
         
         self.btn_parse_playlist.setEnabled(False)
         self.btn_parse_playlist.setText(" 解析中...")
@@ -743,6 +814,8 @@ class MusicDownloaderApp(QMainWindow):
         if not text:
             self.status_label.setText("⚠️ 请先在文本框中粘贴歌单（每行一首）")
             return
+        self._last_playlist_type = 'text'
+        self._last_playlist_input = text
 
         self.btn_parse_text.setEnabled(False)
         self.btn_parse_text.setText(" 解析中...")
@@ -776,6 +849,7 @@ class MusicDownloaderApp(QMainWindow):
             return
 
         self.status_label.setText(f"✓ 成功解析歌单！共 {len(songs)} 首歌曲")
+        self.add_playlist_history(self._last_playlist_type, self._last_playlist_input, len(songs))
 
         self.table_playlist.setRowCount(0)
         for row, s in enumerate(songs, 1):
@@ -808,6 +882,104 @@ class MusicDownloaderApp(QMainWindow):
             self.table_playlist.setRowHeight(row - 1, 36)
 
         self.update_playlist_selection_count()
+
+    # ---------------- 历史记录（搜索 / 解析）持久化 ----------------
+    def _load_history(self):
+        try:
+            if os.path.exists(self.history_file):
+                with open(self.history_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                self.search_history = data.get('search', []) or []
+                self.playlist_history = data.get('playlist', []) or []
+        except Exception:
+            self.search_history = []
+            self.playlist_history = []
+
+    def _save_history(self):
+        try:
+            with open(self.history_file, 'w', encoding='utf-8') as f:
+                json.dump({'search': self.search_history, 'playlist': self.playlist_history},
+                          f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def add_search_history(self, kw):
+        kw = (kw or '').strip()
+        if not kw:
+            return
+        self.search_history = [k for k in self.search_history if k != kw]
+        self.search_history.insert(0, kw)
+        self.search_history = self.search_history[:30]
+        self._save_history()
+        self._refresh_search_history_ui()
+
+    def add_playlist_history(self, ptype, value, count):
+        value = (value or '').strip()
+        if not value:
+            return
+        self.playlist_history = [h for h in self.playlist_history
+                                 if not (h.get('type') == ptype and h.get('value') == value)]
+        ts = time.strftime('%Y-%m-%d %H:%M')
+        self.playlist_history.insert(0, {'type': ptype, 'value': value, 'count': count, 'time': ts})
+        self.playlist_history = self.playlist_history[:30]
+        self._save_history()
+        self._refresh_playlist_history_ui()
+
+    def _refresh_search_history_ui(self):
+        if not hasattr(self, 'list_search_history'):
+            return
+        self.list_search_history.clear()
+        for kw in self.search_history:
+            self.list_search_history.addItem(kw)
+
+    def _refresh_playlist_history_ui(self):
+        if not hasattr(self, 'list_playlist_history'):
+            return
+        self.list_playlist_history.clear()
+        for h in self.playlist_history:
+            item = QListWidgetItem(self._playlist_history_label(h))
+            item.setData(Qt.ItemDataRole.UserRole, h)
+            self.list_playlist_history.addItem(item)
+
+    def _playlist_history_label(self, h):
+        v = h.get('value', '')
+        if h.get('type') == 'text':
+            disp = v.replace('\n', ' / ').replace('\r', '')
+            prefix = '📝 文本'
+        else:
+            disp = v
+            prefix = '🔗 链接'
+        if len(disp) > 46:
+            disp = disp[:46] + '…'
+        return f"{prefix}  {disp}   ·  {h.get('count', 0)} 首   {h.get('time', '')}"
+
+    def on_search_history_clicked(self, item):
+        kw = item.text().strip()
+        if not kw:
+            return
+        self.input_search.setText(kw)
+        self.start_search()
+
+    def on_playlist_history_clicked(self, item):
+        h = item.data(Qt.ItemDataRole.UserRole)
+        if not h:
+            return
+        if h.get('type') == 'text':
+            self.text_playlist.setPlainText(h.get('value', ''))
+            self.start_parse_text()
+        else:
+            self.input_playlist.setText(h.get('value', ''))
+            self.start_parse_playlist()
+
+    def clear_search_history(self):
+        self.search_history = []
+        self._save_history()
+        self._refresh_search_history_ui()
+
+    def clear_playlist_history(self):
+        self.playlist_history = []
+        self._save_history()
+        self._refresh_playlist_history_ui()
 
     def on_playlist_error(self, err):
         self.btn_parse_playlist.setEnabled(True)
@@ -1124,8 +1296,6 @@ class MusicDownloaderApp(QMainWindow):
         file_path = item_path.text() if item_path else ""
 
         menu = QMenu(self)
-        menu.setWindowFlags(menu.windowFlags() | Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint)
-        menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
         # 1. 在资源管理器中高亮定位文件
         act_open_dir = QAction(qta.icon('fa5s.folder-open', color='#0071E3'), "打开文件所在位置", self)
