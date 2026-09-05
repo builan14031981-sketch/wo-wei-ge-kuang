@@ -8,6 +8,8 @@ import threading
 import urllib.parse
 import requests
 import subprocess
+import difflib
+import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 
 FFMPEG_CANDIDATES = ["ffmpeg", "ffmpeg.exe"]
@@ -100,7 +102,7 @@ class GdstudioProvider(MusicProvider):
     def search(self, keyword, source, count):
         name = urllib.parse.quote(keyword)
         url = f"{self.base}?types=search&count={count}&source={source}&pages=1&name={name}"
-        r = requests.get(url, headers=HEADERS, timeout=5)
+        r = requests.get(url, headers=HEADERS, timeout=(5, 5))
         r.raise_for_status()
         items = r.json()
         out = []
@@ -112,7 +114,7 @@ class GdstudioProvider(MusicProvider):
     def get_audio_url(self, song_id, source):
         try:
             url = f"{self.base}?types=url&id={urllib.parse.quote(str(song_id))}&source={source}"
-            res = requests.get(url, headers=HEADERS, timeout=6)
+            res = requests.get(url, headers=HEADERS, timeout=(6, 6))
             res.raise_for_status()
             res = res.json()
             audio_url = res.get('url')
@@ -172,7 +174,7 @@ class GdstudioProvider(MusicProvider):
             req_headers = dict(HEADERS)
             req_headers['Referer'] = 'https://music.163.com/'
             api = f"https://music.163.com/api/playlist/detail?id={pid}"
-            r = requests.get(api, headers=req_headers, timeout=12)
+            r = requests.get(api, headers=req_headers, timeout=(10, 10))
             r.raise_for_status()
             data = r.json()
             if data.get('code') in (20001, 301) or data.get('msg'):
@@ -233,9 +235,9 @@ class MetingProvider(MusicProvider):
             'raw': it
         }
 
-    def _do_get(self, url):
+    def _do_get(self, url, timeout=None):
         try:
-            r = requests.get(url, headers=HEADERS, timeout=6)
+            r = requests.get(url, headers=HEADERS, timeout=timeout or (6, 6))
             r.raise_for_status()
             return r.json()
         except Exception:
@@ -245,12 +247,12 @@ class MetingProvider(MusicProvider):
         base = self._base()
         main_url = f"{base}?type=search&server={source}&msg={urllib.parse.quote(keyword)}&limit={count}"
         items = self._do_get(main_url)
-        # 若当前实例返回错误，逐一尝试其它实例
+        # 若当前实例返回错误，逐一尝试其它实例（快速失败，避免坏节点拖慢整体）
         if not isinstance(items, list):
             for b in self.bases:
                 if b == base:
                     continue
-                j = self._do_get(f"{b}?type=search&server={source}&msg={urllib.parse.quote(keyword)}&limit={count}")
+                j = self._do_get(f"{b}?type=search&server={source}&msg={urllib.parse.quote(keyword)}&limit={count}", timeout=(3, 3))
                 if isinstance(j, list):
                     self._working_base = b
                     items = j
@@ -276,11 +278,11 @@ class MetingProvider(MusicProvider):
             au = None
         if au and str(au).startswith('http'):
             return au, 0, 320
-        # 当前实例失败则换实例重试
+        # 当前实例失败则换实例重试（快速失败，避免坏节点拖慢整体）
         for b in self.bases:
             if b == base:
                 continue
-            j = self._do_get(f"{b}?type=url&id={urllib.parse.quote(str(uid))}&server={src}")
+            j = self._do_get(f"{b}?type=url&id={urllib.parse.quote(str(uid))}&server={src}", timeout=(3, 3))
             if isinstance(j, dict) and j.get('url'):
                 self._working_base = b
                 return j.get('url'), 0, 320
@@ -357,26 +359,92 @@ class MusicEngine:
             return None, 0, 0
         return prov.resolve(item)
 
-    def _find_audio(self, query, count=5):
-        """按优先级跨 Provider 查找首个可下载音源，返回 (url, source, name) 或 None"""
-        for canon in SEARCH_ORDER:
-            for prov in self.providers:
-                mapped = prov.source_map.get(canon)
-                if not mapped:
+    def _match_score(self, title_query, artist_query, item):
+        """候选结果与目标的匹配度打分（0~1）：标题必须像，歌手不符会降权"""
+        t = (item.get('title') or '').lower().strip()
+        a = (item.get('artist') or '').lower().strip()
+        tq = (title_query or '').lower().strip()
+        aq = (artist_query or '').lower().strip()
+        if not tq or not t:
+            return 0.0
+        # 完整串（去空格）完全一致：最高分
+        full = (t + a).replace(' ', '')
+        fullq = (tq + aq).replace(' ', '')
+        if fullq and fullq == full:
+            return 1.0
+        t_score = difflib.SequenceMatcher(None, tq, t).ratio()
+        if tq in t or t in tq:
+            t_score = max(t_score, 0.92)
+        if t_score < 0.45:
+            return 0.0
+        if aq and a:
+            a_score = difflib.SequenceMatcher(None, aq, a).ratio()
+            if aq in a or a in aq:
+                a_score = 1.0
+            if a_score >= 0.5:
+                t_score += 0.15 * a_score
+            else:
+                return 0.0          # 歌手明显不符：直接排除，杜绝“点 A 下到 B”
+        return max(0.0, min(t_score, 1.0))
+
+    def _find_audio(self, title_query, artist_query="", count=5, is_stopped=None, deadline=None):
+        """并发跨 Provider 查找最匹配的可下载音源，返回 (url, source, item) 或 None。
+        各音源并发竞速 + 相似度评分 + 总 deadline + 停止检查，
+        坏节点不会拖慢整体，避免长时间“正在全网搜索”与张冠李戴。"""
+        def _try_source(entry):
+            canon, prov = entry
+            mapped = prov.source_map.get(canon)
+            if not mapped:
+                return None
+            try:
+                items = prov.search(f"{title_query} {artist_query}".strip(), mapped, count)
+            except Exception:
+                return None
+            candidates = []
+            for it in items:
+                name = it.get('title', '')
+                if '伴奏' in name and '伴奏' not in title_query:
                     continue
+                if '片段' in name or '铃声' in name:
+                    continue
+                score = self._match_score(title_query, artist_query, it)
+                if score >= 0.6:
+                    candidates.append((score, it))
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            for score, it in candidates:
                 try:
-                    items = prov.search(query, mapped, count)
+                    audio_url, size, br = self.resolve(it)
                 except Exception:
                     continue
-                for it in items:
-                    name = it.get('title', '')
-                    if '伴奏' in name and '伴奏' not in query:
+                if audio_url and (size > 150000 or canon == 'bilibili'):
+                    return audio_url, canon, it
+            return None
+
+        combos = [(c, p) for c in SEARCH_ORDER
+                  for p in self.providers if p.source_map.get(c)]
+        if not combos:
+            return None
+        end = deadline if deadline is not None else time.time() + 14
+
+        executor = ThreadPoolExecutor(max_workers=8)
+        try:
+            futures = [executor.submit(_try_source, e) for e in combos]
+            try:
+                for f in concurrent.futures.as_completed(futures, timeout=max(0.5, end - time.time())):
+                    if is_stopped and is_stopped():
+                        return None
+                    if f.cancelled():
                         continue
-                    if '片段' in name or '铃声' in name:
+                    try:
+                        r = f.result()
+                    except Exception:
                         continue
-                    audio_url, size, br = self.resolve(it)
-                    if audio_url and (size > 150000 or canon == 'bilibili'):
-                        return audio_url, canon, it
+                    if r:
+                        return r
+            except concurrent.futures.TimeoutError:
+                pass
+        finally:
+            executor.shutdown(wait=False)
         return None
 
     # ---------------- 歌单解析 ----------------
@@ -548,7 +616,7 @@ class MusicEngine:
         return songs
 
     # ---------------- 自动匹配并下载 ----------------
-    def auto_match_and_download(self, title, artist, progress_callback=None, is_stopped=None):
+    def auto_match_and_download(self, title, artist, item=None, progress_callback=None, is_stopped=None):
         def _stopped():
             return bool(is_stopped and is_stopped())
 
@@ -565,23 +633,37 @@ class MusicEngine:
             return False, "已停止"
 
         if progress_callback:
-            progress_callback(10, "正在全网匹配最佳音源...", None)
+            progress_callback(10, "正在匹配最佳音源...", None)
 
-        found_audio = self._find_audio(f"{title} {artist}".strip(), 5)
+        # 优先使用搜索结果自带的精确条目（指哪打哪：直接用该条目的 id 解析直链，
+        # 不再重新搜索，杜绝“点 A 下到 B”的张冠李戴）
+        audio_url, src = None, None
+        if item and item.get('provider') and item.get('source'):
+            prov = self._provider_by_name(item.get('provider'))
+            mapped = prov.source_map.get(item.get('source')) if prov else None
+            if mapped:
+                try:
+                    audio_url, _, _ = prov.resolve(item)
+                    if audio_url:
+                        src = item.get('source')
+                except Exception:
+                    audio_url = None
 
-        if not found_audio:
-            # Fallback by title only
-            found_audio = self._find_audio(title, 3)
-
-        if not found_audio:
-            if progress_callback:
-                progress_callback(-1, "未找到可用音源", None)
-            return False, "未找到可用音源"
+        # 无精确条目或直链解析失败：降级为全网智能匹配（带相似度评分 + 总超时 + 可打断）
+        if not audio_url:
+            deadline = time.time() + 18
+            found_audio = self._find_audio(title, artist or "", 5, _stopped, deadline)
+            if not found_audio and artist:
+                # 歌手词导致匹配不到时，退回仅按歌名匹配
+                found_audio = self._find_audio(title, "", 3, _stopped, time.time() + 12)
+            if not found_audio:
+                if progress_callback:
+                    progress_callback(-1, "未找到可用音源", None)
+                return False, "未找到可用音源"
+            audio_url, src, _ = found_audio
 
         if _stopped():
             return False, "已停止"
-
-        audio_url, src, _ = found_audio
         # 文件名与标签以用户填写为准（可预测、不会因错误匹配而张冠李戴）；缺失时仅用占位
         clean_artist = sanitize_filename(artist) or "未知歌手"
         clean_title = sanitize_filename(title) or "未知歌曲"
@@ -609,7 +691,7 @@ class MusicEngine:
             if 'bilivideo' in audio_url:
                 req_headers['Referer'] = 'https://www.bilibili.com'
 
-            r_dl = requests.get(audio_url, headers=req_headers, stream=True, timeout=30)
+            r_dl = requests.get(audio_url, headers=req_headers, stream=True, timeout=(10, 30))
             if r_dl.status_code != 200:
                 if progress_callback:
                     progress_callback(-1, "流媒体下载失败", None)

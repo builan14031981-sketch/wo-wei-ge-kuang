@@ -34,6 +34,22 @@ SOURCE_DISPLAY = [
 
 # ----------------- 后台工作线程定义 (支持原子级安全打断与停止) -----------------
 
+class ClickableLabel(QLabel):
+    """可点击文字链接（用于历史词条，点击即搜索/填充）"""
+    clicked = pyqtSignal()
+
+    def __init__(self, text="", link_style=True, *a, **k):
+        super().__init__(text, *a, **k)
+        self._link_style = link_style
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        if link_style:
+            self.setStyleSheet("color: #0071E3; background: transparent; padding: 0px;")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
 class SearchThread(QThread):
     results_signal = pyqtSignal(list)
     error_signal = pyqtSignal(str)
@@ -85,18 +101,20 @@ class SourceProbeThread(QThread):
 class SingleDownloadThread(QThread):
     progress_signal = pyqtSignal(int, str, str)
 
-    def __init__(self, engine, title, artist):
+    def __init__(self, engine, title, artist, item=None):
         super().__init__()
         self.engine = engine
         self.title = title
         self.artist = artist
+        self.item = item
         self.is_stopped = False
 
     def run(self):
         def cb(prog, text, path):
             if not self.is_stopped:
                 self.progress_signal.emit(prog, text, path or "")
-        self.engine.auto_match_and_download(self.title, self.artist, progress_callback=cb, is_stopped=lambda: self.is_stopped)
+        self.engine.auto_match_and_download(self.title, self.artist, item=self.item,
+                                            progress_callback=cb, is_stopped=lambda: self.is_stopped)
         if self.is_stopped:
             self.progress_signal.emit(-1, "已停止", "")
 
@@ -126,7 +144,8 @@ class BatchDownloadThread(QThread):
             title = song.get('title', '')
             artist = song.get('artist', '')
             self.song_progress_signal.emit(idx, total, f"{artist} - {title}", "下载中...", "")
-            ok, res = self.engine.auto_match_and_download(title, artist, is_stopped=lambda: not self.is_running)
+            ok, res = self.engine.auto_match_and_download(title, artist, item=song,
+                                                          is_stopped=lambda: not self.is_running)
             status_text = "完成" if ok else (res if isinstance(res, str) and res else "失败")
             file_path = res if ok else ""
             self.song_progress_signal.emit(idx, total, f"{artist} - {title}", status_text, file_path)
@@ -381,13 +400,13 @@ class MusicDownloaderApp(QMainWindow):
     def create_search_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(20, 14, 20, 16)
-        layout.setSpacing(12)
+        layout.setContentsMargins(20, 12, 20, 14)
+        layout.setSpacing(10)
 
         search_card = QFrame()
         search_card.setProperty("class", "CardWidget")
         search_card_layout = QHBoxLayout(search_card)
-        search_card_layout.setContentsMargins(10, 8, 10, 8)
+        search_card_layout.setContentsMargins(10, 6, 10, 6)
         search_card_layout.setSpacing(10)
 
         self.input_search = QLineEdit()
@@ -409,32 +428,43 @@ class MusicDownloaderApp(QMainWindow):
 
         layout.addWidget(search_card)
 
-        # 搜索历史记录
-        sh_card = QFrame()
-        sh_card.setProperty("class", "CardWidget")
-        sh_layout = QVBoxLayout(sh_card)
-        sh_layout.setContentsMargins(10, 8, 10, 8)
-        sh_layout.setSpacing(6)
+        # 搜索历史（一行最近词 + 展开全部；无历史时整行隐藏，不占版面）
+        self.hist_card = QFrame()
+        self.hist_card.setProperty("class", "CardWidget")
+        self.hist_layout = QVBoxLayout(self.hist_card)
+        self.hist_layout.setContentsMargins(12, 4, 12, 4)
+        self.hist_layout.setSpacing(0)
 
-        sh_hdr = QHBoxLayout()
-        sh_title = QLabel("🕘 历史搜索")
-        sh_title.setStyleSheet("font-weight: 600; color: #1D1D1F; font-size: 13px;")
-        self.btn_clear_search_history = QPushButton("清空")
-        self.btn_clear_search_history.setProperty("class", "SecondaryBtn")
-        self.btn_clear_search_history.setIcon(qta.icon('fa5s.trash-alt', color='#4B5563'))
-        self.btn_clear_search_history.clicked.connect(self.clear_search_history)
-        sh_hdr.addWidget(sh_title)
-        sh_hdr.addStretch()
-        sh_hdr.addWidget(self.btn_clear_search_history)
-        sh_layout.addLayout(sh_hdr)
+        self.hist_words_row = QWidget()
+        self.hist_words_row_layout = QHBoxLayout(self.hist_words_row)
+        self.hist_words_row_layout.setContentsMargins(0, 0, 0, 0)
+        self.hist_words_row_layout.setSpacing(8)
 
+        self.lbl_hist_title = QLabel("🕘 历史搜索:  ")
+        self.lbl_hist_title.setStyleSheet("color: #6B7280; font-size: 12px; font-weight: 500; background: transparent;")
+
+        # 展开态列表（开始时隐藏，点击“展开”显示全部历史）
         self.list_search_history = QListWidget()
-        self.list_search_history.setMaximumHeight(96)
-        self.list_search_history.setStyleSheet("background: #FFFFFF; border: 1px solid rgba(0,0,0,0.08); border-radius: 8px; padding: 4px;")
+        self.list_search_history.setMaximumHeight(240)
+        self.list_search_history.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.list_search_history.setStyleSheet(
+            "background: rgba(0, 0, 0, 0.02); border: 1px solid rgba(0, 0, 0, 0.06);"
+            "border-radius: 8px; padding: 2px;"
+        )
         self.list_search_history.itemClicked.connect(self.on_search_history_clicked)
-        sh_layout.addWidget(self.list_search_history)
+        self.list_search_history.setVisible(False)
 
-        layout.addWidget(sh_card)
+        self.hist_words_row_layout.addWidget(self.lbl_hist_title)
+        self._hist_word_widgets = []
+        self.hist_expand_lbl = None
+        self.hist_clear_lbl = None
+        self._hist_expanded = False
+
+        self.hist_layout.addWidget(self.hist_words_row)
+        self.hist_layout.addWidget(self.list_search_history)
+
+        layout.addWidget(self.hist_card)
+        self._refresh_search_history_ui()
 
         # 多选快捷栏 (支持全选/全不选智能Toggle)
         batch_bar = QWidget()
@@ -491,7 +521,7 @@ class MusicDownloaderApp(QMainWindow):
         self.table_search.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table_search.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
 
-        layout.addWidget(self.table_search)
+        layout.addWidget(self.table_search, 1)  # 权重 1：吸收页面剩余空间，避免上方卡片被撑大留空
         self._refresh_search_history_ui()
         return page
 
@@ -570,7 +600,8 @@ class MusicDownloaderApp(QMainWindow):
             btn_dl = QPushButton(" 下载 MP3")
             btn_dl.setProperty("class", "TableDownloadBtn")
             btn_dl.setIcon(qta.icon('fa5s.download', color='#0071E3'))
-            btn_dl.clicked.connect(lambda _, t=item['title'], a=item['artist']: self.trigger_single_download(t, a))
+            btn_dl.clicked.connect(lambda _, it=item: self.trigger_single_download(
+                it.get('title', ''), it.get('artist', ''), it))
 
             self.table_search.setCellWidget(row, 0, chk_widget)
             self.table_search.setItem(row, 1, t_item)
@@ -666,11 +697,11 @@ class MusicDownloaderApp(QMainWindow):
         input_card = QFrame()
         input_card.setProperty("class", "CardWidget")
         input_card_layout = QHBoxLayout(input_card)
-        input_card_layout.setContentsMargins(10, 8, 10, 8)
+        input_card_layout.setContentsMargins(10, 6, 10, 6)
         input_card_layout.setSpacing(10)
 
         self.input_playlist = QLineEdit()
-        self.input_playlist.setPlaceholderText("粘贴歌单分享链接（支持 网易云 / 酷狗；汽水音乐/抖音/喜马拉雅请用下方文本框粘贴歌名）")
+        self.input_playlist.setPlaceholderText("粘贴 网易云 / 酷狗 歌单分享链接（其它平台请用下方文本框粘贴歌名）")
 
         self.btn_parse_playlist = QPushButton(" 解析歌单")
         self.btn_parse_playlist.setProperty("class", "PrimaryBtn")
@@ -686,16 +717,14 @@ class MusicDownloaderApp(QMainWindow):
         paste_card = QFrame()
         paste_card.setProperty("class", "CardWidget")
         paste_card_layout = QHBoxLayout(paste_card)
-        paste_card_layout.setContentsMargins(10, 8, 10, 8)
+        paste_card_layout.setContentsMargins(10, 6, 10, 6)
         paste_card_layout.setSpacing(10)
 
         self.text_playlist = QPlainTextEdit()
         self.text_playlist.setPlaceholderText(
-            "或粘贴歌单文本：每行一首，可写「歌手 - 歌名」或只写歌名。\n"
-            "适用于汽水音乐 / 抖音 / 喜马拉雅 等任意平台——只要拿到歌名，程序会去其它可下载音源搜同名歌曲。"
+            "或粘贴歌单文本：每行一首（歌手 - 歌名），任意平台歌名贴上即可，程序自动去其它音源搜同名歌曲。"
         )
-        self.text_playlist.setMinimumHeight(54)
-        self.text_playlist.setMaximumHeight(110)
+        self.text_playlist.setFixedHeight(64)
 
         self.btn_parse_text = QPushButton(" 解析文本歌单")
         self.btn_parse_text.setProperty("class", "PrimaryBtn")
@@ -707,32 +736,40 @@ class MusicDownloaderApp(QMainWindow):
 
         layout.addWidget(paste_card)
 
-        # 解析历史记录
-        ph_card = QFrame()
-        ph_card.setProperty("class", "CardWidget")
-        ph_layout = QVBoxLayout(ph_card)
-        ph_layout.setContentsMargins(10, 8, 10, 8)
-        ph_layout.setSpacing(6)
+        # 解析历史（一行最近摘要 + 展开全部；无历史时整行隐藏）
+        self.plhist_card = QFrame()
+        self.plhist_card.setProperty("class", "CardWidget")
+        self.plhist_layout = QVBoxLayout(self.plhist_card)
+        self.plhist_layout.setContentsMargins(12, 4, 12, 4)
+        self.plhist_layout.setSpacing(0)
 
-        ph_hdr = QHBoxLayout()
-        ph_title = QLabel("🕘 历史解析")
-        ph_title.setStyleSheet("font-weight: 600; color: #1D1D1F; font-size: 13px;")
-        self.btn_clear_playlist_history = QPushButton("清空")
-        self.btn_clear_playlist_history.setProperty("class", "SecondaryBtn")
-        self.btn_clear_playlist_history.setIcon(qta.icon('fa5s.trash-alt', color='#4B5563'))
-        self.btn_clear_playlist_history.clicked.connect(self.clear_playlist_history)
-        ph_hdr.addWidget(ph_title)
-        ph_hdr.addStretch()
-        ph_hdr.addWidget(self.btn_clear_playlist_history)
-        ph_layout.addLayout(ph_hdr)
+        self.plhist_words_row = QWidget()
+        self.plhist_words_row_layout = QHBoxLayout(self.plhist_words_row)
+        self.plhist_words_row_layout.setContentsMargins(0, 0, 0, 0)
+        self.plhist_words_row_layout.setSpacing(8)
+
+        self.lbl_plhist_title = QLabel("🕘 历史解析:  ")
+        self.lbl_plhist_title.setStyleSheet("color: #6B7280; font-size: 12px; font-weight: 500; background: transparent;")
 
         self.list_playlist_history = QListWidget()
-        self.list_playlist_history.setMaximumHeight(96)
-        self.list_playlist_history.setStyleSheet("background: #FFFFFF; border: 1px solid rgba(0,0,0,0.08); border-radius: 8px; padding: 4px;")
+        self.list_playlist_history.setMaximumHeight(240)
+        self.list_playlist_history.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.list_playlist_history.setStyleSheet(
+            "background: rgba(0, 0, 0, 0.02); border: 1px solid rgba(0, 0, 0, 0.06);"
+            "border-radius: 8px; padding: 2px;"
+        )
         self.list_playlist_history.itemClicked.connect(self.on_playlist_history_clicked)
-        ph_layout.addWidget(self.list_playlist_history)
+        self.list_playlist_history.setVisible(False)
 
-        layout.addWidget(ph_card)
+        self.plhist_words_row_layout.addWidget(self.lbl_plhist_title)
+        self._plhist_word_widgets = []
+        self._plhist_expanded = False
+
+        self.plhist_layout.addWidget(self.plhist_words_row)
+        self.plhist_layout.addWidget(self.list_playlist_history)
+
+        layout.addWidget(self.plhist_card)
+        self._refresh_playlist_history_ui()
 
         # 歌单多选快捷栏
         pl_batch_bar = QWidget()
@@ -788,7 +825,7 @@ class MusicDownloaderApp(QMainWindow):
         self.table_playlist.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table_playlist.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
 
-        layout.addWidget(self.table_playlist)
+        layout.addWidget(self.table_playlist, 1)  # 权重 1：吸收页面剩余空间
         self.current_parsed_songs = []
         self._refresh_playlist_history_ui()
         return page
@@ -928,18 +965,147 @@ class MusicDownloaderApp(QMainWindow):
     def _refresh_search_history_ui(self):
         if not hasattr(self, 'list_search_history'):
             return
+        # 清掉旧的词条显示（保留标题）
+        while self.hist_words_row_layout.count() > 1:
+            it = self.hist_words_row_layout.takeAt(1)
+            w = it.widget()
+            if w:
+                w.deleteLater()
+        self._hist_word_widgets = []
         self.list_search_history.clear()
-        for kw in self.search_history:
-            self.list_search_history.addItem(kw)
+
+        kws = self.search_history
+        self.hist_card.setVisible(bool(kws))
+        if not kws:
+            self.list_search_history.setVisible(False)
+            return
+
+        self.list_search_history.setVisible(self._hist_expanded)
+
+        kws_row = kws if self._hist_expanded else kws[:5]
+        for i, kw in enumerate(kws_row):
+            lbl = ClickableLabel(kw, link_style=False)
+            lbl.setStyleSheet("color: #374151; background: transparent; font-size: 12px; padding: 0px;")
+            lbl.clicked.connect(lambda k=kw: self._use_search_history(k))
+            self.hist_words_row_layout.addWidget(lbl)
+            self._hist_word_widgets.append(lbl)
+            if i < len(kws_row) - 1:
+                dot = QLabel("·")
+                dot.setStyleSheet("color: #9CA3AF; background: transparent; font-size: 12px;")
+                self.hist_words_row_layout.addWidget(dot)
+                self._hist_word_widgets.append(dot)
+
+        # 展开/收起 与 清空
+        self.hist_words_row_layout.addStretch(1)
+        if len(kws) > 5 or self._hist_expanded:
+            self.hist_expand_lbl = ClickableLabel("  收起" if self._hist_expanded else f"  展开全部 ({len(kws)})")
+            self.hist_expand_lbl.setStyleSheet(
+                "color: #0071E3; background: transparent; font-size: 12px; padding: 0px; font-weight: 500;")
+            self.hist_expand_lbl.clicked.connect(self.toggle_search_history_expand)
+            self.hist_words_row_layout.addWidget(self.hist_expand_lbl)
+            self.hist_words_row_layout.addWidget(self._sep())
+        self.hist_clear_lbl = ClickableLabel("清空")
+        self.hist_clear_lbl.setStyleSheet(
+            "color: #9CA3AF; background: transparent; font-size: 12px; padding: 0px;")
+        self.hist_clear_lbl.clicked.connect(self.clear_search_history)
+        self.hist_words_row_layout.addWidget(self.hist_clear_lbl)
+
+        # 展开态：填充完整列表
+        if self._hist_expanded:
+            for kw in kws:
+                it = QListWidgetItem(kw)
+                it.setData(Qt.ItemDataRole.UserRole, kw)
+                self.list_search_history.addItem(it)
+
+    def _sep(self):
+        s = QLabel("|")
+        s.setStyleSheet("color: #E5E7EB; background: transparent; font-size: 11px;")
+        return s
+
+    def toggle_search_history_expand(self):
+        self._hist_expanded = not self._hist_expanded
+        self._refresh_search_history_ui()
+
+    def _use_search_history(self, kw):
+        self.input_search.setText(kw)
+        self.start_search()
 
     def _refresh_playlist_history_ui(self):
         if not hasattr(self, 'list_playlist_history'):
             return
+        while self.plhist_words_row_layout.count() > 1:
+            it = self.plhist_words_row_layout.takeAt(1)
+            w = it.widget()
+            if w:
+                w.deleteLater()
+        self._plhist_word_widgets = []
         self.list_playlist_history.clear()
-        for h in self.playlist_history:
-            item = QListWidgetItem(self._playlist_history_label(h))
-            item.setData(Qt.ItemDataRole.UserRole, h)
-            self.list_playlist_history.addItem(item)
+
+        history = self.playlist_history
+        self.plhist_card.setVisible(bool(history))
+        if not history:
+            self.list_playlist_history.setVisible(False)
+            return
+
+        self.list_playlist_history.setVisible(self._plhist_expanded)
+
+        for i, h in enumerate(history[:2]):
+            text, _ = self._plhist_history_brief(h)
+            lbl = ClickableLabel(text, link_style=False)
+            lbl.setStyleSheet("color: #374151; background: transparent; font-size: 12px; padding: 0px;")
+            lbl.clicked.connect(lambda hh=h: self._use_playlist_history(hh))
+            self.plhist_words_row_layout.addWidget(lbl)
+            self._plhist_word_widgets.append(lbl)
+            if i < min(len(history), 2) - 1:
+                dot = QLabel("·")
+                dot.setStyleSheet("color: #9CA3AF; background: transparent; font-size: 12px;")
+                self.plhist_words_row_layout.addWidget(dot)
+                self._plhist_word_widgets.append(dot)
+
+        self.plhist_words_row_layout.addStretch(1)
+        if len(history) > 2 or self._plhist_expanded:
+            expand_lbl = ClickableLabel("  收起" if self._plhist_expanded else f"  展开全部 ({len(history)})")
+            expand_lbl.setStyleSheet(
+                "color: #0071E3; background: transparent; font-size: 12px; padding: 0px; font-weight: 500;")
+            expand_lbl.clicked.connect(self.toggle_playlist_history_expand)
+            self.plhist_words_row_layout.addWidget(expand_lbl)
+            self.plhist_words_row_layout.addWidget(self._sep())
+            self._plhist_word_widgets.append(expand_lbl)
+        clear_lbl = ClickableLabel("清空")
+        clear_lbl.setStyleSheet("color: #9CA3AF; background: transparent; font-size: 12px; padding: 0px;")
+        clear_lbl.clicked.connect(self.clear_playlist_history)
+        self.plhist_words_row_layout.addWidget(clear_lbl)
+        self._plhist_word_widgets.append(clear_lbl)
+
+        if self._plhist_expanded:
+            for h in history:
+                item = QListWidgetItem(self._playlist_history_label(h))
+                item.setData(Qt.ItemDataRole.UserRole, h)
+                self.list_playlist_history.addItem(item)
+
+    def _plhist_history_brief(self, h):
+        v = h.get('value', '')
+        if h.get('type') == 'text':
+            disp = v.replace('\n', ' / ').replace('\r', '')
+            prefix = '📝'
+        else:
+            disp = v
+            prefix = '🔗'
+        if len(disp) > 10:
+            disp = disp[:10] + '…'
+        return f"{prefix} {disp}", h
+
+    def toggle_playlist_history_expand(self):
+        self._plhist_expanded = not self._plhist_expanded
+        self._refresh_playlist_history_ui()
+
+    def _use_playlist_history(self, h):
+        if h.get('type') == 'text':
+            self.text_playlist.setPlainText(h.get('value', ''))
+            self.start_parse_text()
+        else:
+            self.input_playlist.setText(h.get('value', ''))
+            self.start_parse_playlist()
 
     def _playlist_history_label(self, h):
         v = h.get('value', '')
@@ -954,7 +1120,8 @@ class MusicDownloaderApp(QMainWindow):
         return f"{prefix}  {disp}   ·  {h.get('count', 0)} 首   {h.get('time', '')}"
 
     def on_search_history_clicked(self, item):
-        kw = item.text().strip()
+        kw = item.data(Qt.ItemDataRole.UserRole) or ""
+        kw = str(kw).strip()
         if not kw:
             return
         self.input_search.setText(kw)
@@ -1057,8 +1224,8 @@ class MusicDownloaderApp(QMainWindow):
     def create_tasks_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(20, 16, 20, 16)
-        layout.setSpacing(14)
+        layout.setContentsMargins(20, 12, 20, 14)
+        layout.setSpacing(12)
 
         # 顶层控制卡片
         top_card = QFrame()
@@ -1132,7 +1299,7 @@ class MusicDownloaderApp(QMainWindow):
         layout.addWidget(self.table_tasks)
         return page
 
-    def trigger_single_download(self, title, artist):
+    def trigger_single_download(self, title, artist, item=None):
         self.switch_page(2)
         row = self.table_tasks.rowCount()
         self.table_tasks.insertRow(row)
@@ -1155,7 +1322,7 @@ class MusicDownloaderApp(QMainWindow):
         self.table_tasks.setCellWidget(row, 4, btn_del)
         self.table_tasks.setRowHeight(row, 36)
 
-        thread = SingleDownloadThread(self.engine, title, artist)
+        thread = SingleDownloadThread(self.engine, title, artist, item)
         thread.progress_signal.connect(lambda p, t, path, r=row: self.on_single_download_progress(r, p, t, path))
         self.active_single_downloads.append(thread)
         thread.start()
@@ -1355,13 +1522,14 @@ class MusicDownloaderApp(QMainWindow):
     def create_settings_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(20, 16, 20, 16)
-        layout.setSpacing(14)
+        layout.setContentsMargins(20, 14, 20, 16)
+        layout.setSpacing(16)
 
         card_dir = QFrame()
         card_dir.setProperty("class", "CardWidget")
         card_dir_layout = QVBoxLayout(card_dir)
-        card_dir_layout.setSpacing(8)
+        card_dir_layout.setContentsMargins(16, 14, 16, 16)
+        card_dir_layout.setSpacing(12)
 
         lbl_dir_title = QLabel("📁 MP3 下载存储路径")
         lbl_dir_title.setStyleSheet("font-weight: 600; color: #1D1D1F; font-size: 14px;")
@@ -1385,7 +1553,8 @@ class MusicDownloaderApp(QMainWindow):
         card_opt = QFrame()
         card_opt.setProperty("class", "CardWidget")
         card_opt_layout = QVBoxLayout(card_opt)
-        card_opt_layout.setSpacing(12)
+        card_opt_layout.setContentsMargins(16, 14, 16, 16)
+        card_opt_layout.setSpacing(16)
 
         lbl_opt_title = QLabel("⚡ 下载引擎与音频转码配置")
         lbl_opt_title.setStyleSheet("font-weight: 600; color: #1D1D1F; font-size: 14px;")
@@ -1415,7 +1584,16 @@ class MusicDownloaderApp(QMainWindow):
         card_opt_layout.addLayout(row2)
         layout.addWidget(card_opt)
 
-        layout.addStretch()
+        # 垂直居中：卡片组+版本行整体居中，上下留白对称
+        layout.addStretch(1)
+        layout.addWidget(card_dir)
+        layout.addWidget(card_opt)
+        footer = QLabel("我为歌狂 An 1.0 · 聚合全网音源 · 320Kbps MP3 下载器")
+        footer.setStyleSheet("color: #9CA3AF; font-size: 11px; background: transparent;")
+        footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(footer)
+        layout.addStretch(1)
+        layout.addSpacing(6)
         return page
 
     def browse_output_dir(self):
